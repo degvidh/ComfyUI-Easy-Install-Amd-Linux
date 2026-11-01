@@ -164,6 +164,169 @@ if [ ! -d "ComfyUI-Easy-Install" ]; then
 fi
 cd ComfyUI-Easy-Install
 
+# ─── GPU backend detection (NVIDIA CUDA / AMD ROCm / CPU) ───────────
+# Override with:  CEI_GPU=amd|nvidia|cpu ./ComfyUI-Easy-Install.sh
+# Optional:       CEI_ROCM_VERSION=7.2  CEI_AMD_GFX=gfx1150
+detect_amd_gpu() {
+    local card vendor
+    for card in /sys/class/drm/card[0-9]*/device; do
+        [ -r "$card/vendor" ] || continue
+        vendor=$(cat "$card/vendor" 2>/dev/null)
+        if [ "$vendor" = "0x1002" ]; then
+            return 0
+        fi
+    done
+    # Fallback for systems without DRM sysfs (containers, older kernels)
+    if command -v lspci >/dev/null 2>&1; then
+        lspci 2>/dev/null | grep -iE 'VGA compatible controller|Display controller' \
+            | grep -qiE 'AMD/ATI|Advanced Micro Devices' && return 0
+    fi
+    return 1
+}
+
+detect_gpu_vendor() {
+    local force="${CEI_GPU:-}"
+    if [ -n "$force" ]; then
+        printf '%s\n' "$force"
+        return 0
+    fi
+    if [ "$(uname -s)" = "Darwin" ]; then
+        printf 'apple\n'
+        return 0
+    fi
+    # An NVIDIA dGPU is usually the faster compute device on hybrid laptops,
+    # so prefer it when nvidia-smi reports a working GPU.
+    if command -v nvidia-smi >/dev/null 2>&1 \
+        && nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1; then
+        printf 'nvidia\n'
+        return 0
+    fi
+    if detect_amd_gpu; then
+        printf 'amd\n'
+        return 0
+    fi
+    printf 'cpu\n'
+}
+
+detect_amd_gfx_arch() {
+    local card id arch=""
+    if [ -n "${CEI_AMD_GFX:-}" ]; then
+        printf '%s\n' "$CEI_AMD_GFX"
+        return 0
+    fi
+    if command -v rocminfo >/dev/null 2>&1; then
+        arch=$(rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | head -n1)
+        if [ -n "$arch" ]; then
+            printf '%s\n' "$arch"
+            return 0
+        fi
+    fi
+    for card in /sys/class/drm/card[0-9]*/device; do
+        [ -r "$card/vendor" ] || continue
+        [ "$(cat "$card/vendor" 2>/dev/null)" = "0x1002" ] || continue
+        id=$(cat "$card/device" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        case "$id" in
+            0x150e) arch="gfx1150" ;;   # Strix Point (Radeon 880M/890M)
+            0x1586) arch="gfx1151" ;;   # Strix Halo
+            0x1114|0x1115) arch="gfx1152" ;;  # Krackan Point
+            0x744c) arch="gfx1100" ;;   # Navi 31 (RX 7900)
+            0x747e) arch="gfx1101" ;;   # Navi 32 (RX 7800/7700)
+            0x7480) arch="gfx1102" ;;   # Navi 33 (RX 7600)
+            0x73bf) arch="gfx1030" ;;   # Navi 21 (RX 6800/6900)
+            0x73df) arch="gfx1031" ;;   # Navi 22 (RX 6700)
+            0x73ef) arch="gfx1032" ;;   # Navi 23 (RX 6600)
+            0x731f) arch="gfx1010" ;;   # Navi 10 (RX 5700)
+        esac
+        break
+    done
+    [ -n "$arch" ] && printf '%s\n' "$arch"
+    return 0
+}
+
+detect_amd_gpu_name() {
+    local name=""
+    if command -v lspci >/dev/null 2>&1; then
+        name=$(lspci 2>/dev/null | grep -iE 'VGA compatible controller|Display controller' \
+            | grep -iE 'AMD/ATI|Advanced Micro Devices' | head -n1 \
+            | sed 's/.*: //; s/ (rev.*//; s/^Advanced Micro Devices, Inc. \[AMD\/ATI\] //')
+    fi
+    printf '%s\n' "${name:-AMD GPU}"
+}
+
+# ROCm wheels need a few system libraries and an accessible KFD device.
+# Do not install packages automatically; print the right command per distro.
+check_amd_runtime_deps() {
+    local missing=()
+    if ! ldconfig -p 2>/dev/null | grep -q 'libnuma\.so\.1'; then missing+=("numactl"); fi
+    if ! ldconfig -p 2>/dev/null | grep -q 'libdrm\.so\.2'; then missing+=("libdrm"); fi
+    if ! ldconfig -p 2>/dev/null | grep -q 'libelf\.so\.1'; then missing+=("elfutils"); fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "  ${YELLOW}!${RESET} Missing ROCm runtime libraries: ${BOLD}${missing[*]}${RESET}"
+        if command -v pacman >/dev/null 2>&1; then
+            echo -e "    ${BOLD}sudo pacman -S --needed numactl libdrm elfutils${RESET}"
+        elif command -v apt-get >/dev/null 2>&1; then
+            echo -e "    ${BOLD}sudo apt install libnuma1 libdrm2 libelf1${RESET}"
+        elif command -v dnf >/dev/null 2>&1; then
+            echo -e "    ${BOLD}sudo dnf install numactl libdrm elfutils-libelf${RESET}"
+        fi
+    fi
+
+    if [ ! -e /dev/kfd ]; then
+        echo -e "  ${YELLOW}!${RESET} /dev/kfd is missing - load the amdgpu driver before running ComfyUI."
+    elif [ ! -r /dev/kfd ] || [ ! -w /dev/kfd ]; then
+        echo -e "  ${YELLOW}!${RESET} /dev/kfd is not accessible by ${USER} - add yourself to the render group:"
+        echo -e "    ${BOLD}sudo usermod -aG render,video \$USER${RESET}   (then log out/in)"
+    fi
+}
+
+GPU_VENDOR="$(detect_gpu_vendor)"
+AMD_GFX_ARCH=""
+AMD_GPU_NAME=""
+ROCM_VERSION="${CEI_ROCM_VERSION:-7.2}"
+ROCM_INDEX="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
+
+echo ""
+echo -e "${GREEN}::::::::::::::: ${YELLOW}GPU backend detection${GREEN} :::::::::::::::${RESET}"
+case "$GPU_VENDOR" in
+    amd)
+        AMD_GFX_ARCH="$(detect_amd_gfx_arch)"
+        AMD_GPU_NAME="$(detect_amd_gpu_name)"
+        echo -e "  ${GREEN}✓${RESET} AMD GPU: ${YELLOW}${AMD_GPU_NAME}${RESET}"
+        [ -n "$AMD_GFX_ARCH" ] && echo -e "  ${GREEN}✓${RESET} LLVM target: ${YELLOW}${AMD_GFX_ARCH}${RESET}"
+        echo -e "  ${GREEN}✓${RESET} PyTorch ROCm ${ROCM_VERSION} wheels selected"
+        echo -e "  ${YELLOW}Note:${RESET} CUDA-only add-ons (SageAttention, FlashAttention, Nunchaku) are skipped."
+        check_amd_runtime_deps
+        ;;
+    nvidia)
+        echo -e "  ${GREEN}✓${RESET} NVIDIA GPU detected - using CUDA 13.0 wheels"
+        ;;
+    apple)
+        echo -e "  ${GREEN}✓${RESET} Apple Silicon - using MPS wheels"
+        ;;
+    *)
+        echo -e "  ${YELLOW}!${RESET} No supported GPU detected - using CPU wheels"
+        ;;
+esac
+echo ""
+
+# Remember the backend for launchers/update scripts and persist AMD defaults.
+printf '%s\n' "$GPU_VENDOR" > .cei_gpu_backend
+if [ "$GPU_VENDOR" = "amd" ]; then
+    cat > .cei_amd_env <<EOF
+# AMD ROCm environment for this install (sourced by run_amd_gpu.sh)
+AMD_GPU_NAME='${AMD_GPU_NAME}'
+AMD_GFX_ARCH='${AMD_GFX_ARCH}'
+ROCM_VERSION='${ROCM_VERSION}'
+
+# Uncomment only if the bundled ROCm runtime cannot see your GPU:
+# HSA_OVERRIDE_GFX_VERSION=11.0.0
+
+# Uncomment if the APU hangs/freezes under sustained load:
+# HSA_ENABLE_SDMA=0
+EOF
+fi
+
 # Copy bundled patches (e.g. RMBG SAM3 macOS fix) into the install directory
 # before custom nodes are cloned. get_node applies these during the RMBG
 # install; the full Helper zip extract happens at the end of the script,
@@ -523,7 +686,70 @@ EOL
         # For macOS, install without CUDA index
         uv pip install $UV_ARGS torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
         echo -e "${GREEN}✓${RESET} PyTorch installed (macOS version)"
-    else
+    elif [ "$GPU_VENDOR" = "amd" ]; then
+        echo -e "${YELLOW}Installing PyTorch 2.11.0 + ROCm ${ROCM_VERSION} for ${AMD_GPU_NAME}...${RESET}"
+        TORCH_INSTALL_RETRIES=3
+        TORCH_INSTALLED=false
+        for attempt in $(seq 1 $TORCH_INSTALL_RETRIES); do
+            if uv pip install $UV_ARGS torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url "$ROCM_INDEX"; then
+                echo -e "${GREEN}✓${RESET} PyTorch installed (ROCm ${ROCM_VERSION})"
+                TORCH_INSTALLED=true
+                break
+            else
+                echo -e "${YELLOW}Attempt $attempt failed (pytorch.org ROCm index), retrying... (${attempt}/${TORCH_INSTALL_RETRIES})${RESET}"
+                sleep 5
+            fi
+        done
+        if [ "$TORCH_INSTALLED" = false ]; then
+            echo -e "${YELLOW}ROCm index failed. Retrying with PyPI as a fallback for dependencies...${RESET}"
+            for attempt in $(seq 1 $TORCH_INSTALL_RETRIES); do
+                if uv pip install $UV_ARGS torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+                    --index-url "$ROCM_INDEX" \
+                    --extra-index-url https://pypi.org/simple; then
+                    echo -e "${GREEN}✓${RESET} PyTorch installed (ROCm ${ROCM_VERSION} via PyPI fallback)"
+                    TORCH_INSTALLED=true
+                    break
+                else
+                    echo -e "${YELLOW}Attempt $attempt failed (PyPI fallback), retrying... (${attempt}/${TORCH_INSTALL_RETRIES})${RESET}"
+                    sleep 5
+                fi
+            done
+        fi
+        if [ "$TORCH_INSTALLED" = false ]; then
+            echo -e "${RED}✗ Failed to install ROCm PyTorch after $TORCH_INSTALL_RETRIES attempts${RESET}"
+            echo -e "${YELLOW}Try again, or install manually:${RESET}"
+            echo -e "  ${BOLD}uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url ${ROCM_INDEX}${RESET}"
+            exit 1
+        fi
+
+        # Verify that the HIP runtime can see the GPU. Failure is not fatal:
+        # ComfyUI still starts, but model generation will fall back to CPU.
+        echo -e "${YELLOW}Verifying ROCm device visibility...${RESET}"
+        if ! "$EMBEDDED_PYTHON" - <<'PY'
+import sys
+try:
+    import torch
+except Exception as exc:
+    print(f"torch import failed: {exc}")
+    sys.exit(1)
+hip = getattr(torch.version, "hip", None)
+available = torch.cuda.is_available()
+print(f"torch {torch.__version__} | HIP {hip or 'none'} | GPU available: {available}")
+if available:
+    props = torch.cuda.get_device_properties(0)
+    print(f"Device: {torch.cuda.get_device_name(0)} ({props.total_memory / 1024**3:.1f} GiB visible)")
+sys.exit(0 if available else 1)
+PY
+        then
+            echo -e "${YELLOW}⚠ PyTorch cannot see the AMD GPU yet.${RESET}"
+            echo -e "  ${BOLD}1.${RESET} Make sure your user is in the ${YELLOW}render${RESET} and ${YELLOW}video${RESET} groups: ${BOLD}sudo usermod -aG render,video \$USER${RESET}"
+            echo -e "  ${BOLD}2.${RESET} Check that ${YELLOW}/dev/kfd${RESET} and ${YELLOW}/dev/dri/renderD128${RESET} exist and are accessible."
+            echo -e "  ${BOLD}3.${RESET} Reboot (or log out/in) after changing groups."
+            echo -e "  ${BOLD}4.${RESET} If your GPU is newer than the ROCm wheel, try: ${BOLD}HSA_OVERRIDE_GFX_VERSION=11.0.0${RESET}"
+            echo -e "     (add it to ${YELLOW}.cei_amd_env${RESET} in the install folder)."
+            echo -e "  ${YELLOW}Continuing installation; ComfyUI will use CPU until this is fixed.${RESET}"
+        fi
+    elif [ "$GPU_VENDOR" = "nvidia" ]; then
         echo -e "${YELLOW}Installing PyTorch 2.11.0 + CUDA 13.0...${RESET}"
         if ! check_nvidia_driver; then
             echo -e "${YELLOW}Continuing with the CUDA build of PyTorch. ComfyUI will run on CPU until an NVIDIA driver is installed.${RESET}"
@@ -564,6 +790,11 @@ EOL
             echo -e "  ${BOLD}uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://pypi.org/simple${RESET}"
             exit 1
         fi
+    else
+        echo -e "${YELLOW}Installing PyTorch 2.11.0 (CPU build - no supported GPU found)...${RESET}"
+        uv pip install $UV_ARGS torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+        echo -e "${GREEN}✓${RESET} PyTorch installed (CPU version)"
     fi
     
     echo -e "${GREEN}::::::::::::::: ${YELLOW}Pre-installation of required modules${GREEN} :::::::::::::::${RESET}"
@@ -573,6 +804,13 @@ EOL
     # Handle onnxruntime based on platform
     if [ "$(uname)" = "Darwin" ]; then
         echo -e "${YELLOW}Installing onnxruntime (CPU version for macOS)...${RESET}"
+        uv pip install onnxruntime $UV_ARGS
+    elif [ "$GPU_VENDOR" = "amd" ]; then
+        # onnxruntime-gpu is a CUDA build and does not work on ROCm. Use the
+        # CPU build: RMBG/segmentation nodes still work, just slower. A
+        # matching onnxruntime-rocm can be installed manually when a system
+        # ROCm SDK is present, but the bundled torch wheels do not ship it.
+        echo -e "${YELLOW}Installing onnxruntime (CPU build for AMD/ROCm)...${RESET}"
         uv pip install onnxruntime $UV_ARGS
     else
         echo -e "${YELLOW}Installing onnxruntime (GPU version for Linux)...${RESET}"
@@ -590,6 +828,34 @@ EOL
         # macOS version - install from source with Metal support
         echo -e "${YELLOW}Installing llama-cpp-python v0.3.40 with Metal support for macOS...${RESET}"
         CMAKE_ARGS="-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_APPLE_SILICON_PROCESSOR=arm64 -DGGML_METAL=on" uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS
+    elif [ "$GPU_VENDOR" = "amd" ]; then
+        # No prebuilt ROCm wheel for this fork. Prefer HIP when a ROCm
+        # toolchain is installed, then Vulkan (works with Mesa's RADV on
+        # Arch/Fedora without the full ROCm SDK), then CPU.
+        echo -e "${YELLOW}Installing llama-cpp-python v0.3.40 for AMD...${RESET}"
+        HIPCC="$(command -v hipcc 2>/dev/null || true)"
+        if [ -z "$HIPCC" ] && [ -x /opt/rocm/bin/hipcc ]; then
+            HIPCC="/opt/rocm/bin/hipcc"
+            export PATH="/opt/rocm/bin:$PATH"
+        fi
+        if [ -n "$HIPCC" ]; then
+            echo -e "${GREEN}✓${RESET} ROCm toolchain found - building with HIP (${AMD_GFX_ARCH:-native arch})"
+            CMAKE_ARGS="-DGGML_HIP=on -DGGML_HIPBLAS=on -DAMDGPU_TARGETS=${AMD_GFX_ARCH:-gfx1150}" \
+                uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS \
+            || CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" \
+                uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS
+        elif pkg-config --exists vulkan 2>/dev/null; then
+            echo -e "${GREEN}✓${RESET} Vulkan SDK found - building with the Vulkan backend"
+            CMAKE_ARGS="-DGGML_VULKAN=on" \
+                uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS \
+            || CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" \
+                uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS
+        else
+            echo -e "${YELLOW}No ROCm/Vulkan development files found - using CPU llama.cpp${RESET}"
+            echo -e "${YELLOW}Install 'vulkan-headers shaderc' (Arch) for GPU acceleration, then rerun.${RESET}"
+            CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" \
+                uv pip install --upgrade --force-reinstall "llama-cpp-python @ git+https://github.com/JamePeng/llama-cpp-python.git" $UV_ARGS
+        fi
     else
         # Linux version - try different CUDA versions
         # Note: JamePeng v0.3.40 has no cu130 Linux build; cu128 is the closest
@@ -818,6 +1084,23 @@ get_node() {
                 if grep -qi "onnxruntime" "./ComfyUI/custom_nodes/${GIT_FOLDER}/requirements.txt"; then
                     uv pip install onnxruntime $UV_ARGS
                 fi
+            elif [ "$GPU_VENDOR" = "amd" ]; then
+                # AMD/ROCm: drop CUDA-only packages, keep everything else.
+                # torch/torchvision/torchaudio stay on the pinned ROCm build;
+                # triton comes from pytorch-triton-rocm, not PyPI.
+                grep -viE "^(torch|torchvision|torchaudio)([<>=!~]|$)" \
+                    "./ComfyUI/custom_nodes/${GIT_FOLDER}/requirements.txt" \
+                    | grep -viE "onnxruntime-gpu|^(triton|pytorch-triton)|flash[-_]attn|xformers|sageattention|nunchaku|tensorrt|^(nvidia-|cupy-cuda)" \
+                    > "/tmp/requirements_temp.txt" 2>/dev/null || true
+                if [ -s "/tmp/requirements_temp.txt" ]; then
+                    uv pip install -r "/tmp/requirements_temp.txt" $UV_ARGS
+                fi
+                rm -f "/tmp/requirements_temp.txt"
+                # Provide a working CPU onnxruntime for nodes that asked for GPU
+                if grep -qi "onnxruntime" "./ComfyUI/custom_nodes/${GIT_FOLDER}/requirements.txt"; then
+                    uv pip uninstall $UV_NC onnxruntime-gpu >/dev/null 2>&1 || true
+                    uv pip install onnxruntime $UV_ARGS || true
+                fi
             else
                 # Linux: install as-is but filter torch to prevent upgrading pinned version
                 grep -viE "^(torch|torchvision|torchaudio)([<>=!~]|$)" "./ComfyUI/custom_nodes/${GIT_FOLDER}/requirements.txt" > "/tmp/requirements_temp.txt" 2>/dev/null || true
@@ -972,6 +1255,8 @@ CURRENT_TORCH=$("$EMBEDDED_PYTHON" -c "import torch; print(torch.__version__)" 2
 echo -e "${YELLOW}Current torch: ${CURRENT_TORCH}${RESET}"
 if [ "$(uname)" = "Darwin" ]; then
     EXPECTED_TORCH="2.11.0"
+elif [ "$GPU_VENDOR" = "amd" ]; then
+    EXPECTED_TORCH="2.11.0+rocm${ROCM_VERSION}"
 else
     EXPECTED_TORCH="2.11.0+cu130"
 fi
@@ -979,6 +1264,8 @@ if [ "$CURRENT_TORCH" != "$EXPECTED_TORCH" ]; then
     echo -e "${YELLOW}Torch was changed to ${CURRENT_TORCH}, re-pinning to ${EXPECTED_TORCH}...${RESET}"
     if [ "$(uname)" = "Darwin" ]; then
         uv pip install $UV_ARGS torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
+    elif [ "$GPU_VENDOR" = "amd" ]; then
+        uv pip install $UV_ARGS torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url "$ROCM_INDEX"
     else
         uv pip install $UV_ARGS torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
     fi
@@ -991,14 +1278,36 @@ echo ""
 # Install Triton matching Torch requirements (Linux only)
 if [ "$(uname -s)" = "Linux" ]; then
     echo -e "${GREEN}::::::::::::::: Installing ${YELLOW}Triton${GREEN} :::::::::::::::${RESET}"
-    TRITON_VER=$("$EMBEDDED_PYTHON" -c "import importlib.metadata; dist = importlib.metadata.metadata('torch'); reqs = [r for r in (dist.get_all('Requires-Dist') or []) if r.startswith('triton')]; ver = reqs[0].split('==')[1].split(';')[0].strip() if reqs and '==' in reqs[0] else ''; print(ver)" 2>/dev/null)
-    if [ -n "$TRITON_VER" ]; then
-        echo -e "${YELLOW}Torch requires triton==${TRITON_VER}${RESET}"
-        "$EMBEDDED_PYTHON" -m pip install --upgrade --force-reinstall "triton==${TRITON_VER}" $PIP_ARGS || echo -e "${YELLOW}Triton install skipped${RESET}"
+    if [ "$GPU_VENDOR" = "amd" ]; then
+        # ROCm wheels depend on pytorch-triton-rocm; never replace it with the
+        # CUDA-only PyPI 'triton' package.
+        read -r TRITON_PKG TRITON_VER <<< "$("$EMBEDDED_PYTHON" -c "import importlib.metadata as md; reqs = md.metadata('torch').get_all('Requires-Dist') or []; r = next((x for x in reqs if x.startswith(('pytorch-triton-rocm','triton'))), ''); print(r.split('==')[0].strip(), r.split('==')[1].split(';')[0].strip()) if '==' in r else print('')" 2>/dev/null)"
+        if [ -n "${TRITON_VER:-}" ]; then
+            echo -e "${YELLOW}Torch requires ${TRITON_PKG}==${TRITON_VER}${RESET}"
+            uv pip install $UV_ARGS --force-reinstall "${TRITON_PKG}==${TRITON_VER}" --index-url "$ROCM_INDEX" \
+                || echo -e "${YELLOW}ROCm Triton install skipped${RESET}"
+        else
+            echo -e "${YELLOW}Could not determine ROCm Triton version, skipping${RESET}"
+        fi
     else
-        echo -e "${YELLOW}Could not determine triton version from torch metadata, skipping${RESET}"
+        TRITON_VER=$("$EMBEDDED_PYTHON" -c "import importlib.metadata; dist = importlib.metadata.metadata('torch'); reqs = [r for r in (dist.get_all('Requires-Dist') or []) if r.startswith('triton')]; ver = reqs[0].split('==')[1].split(';')[0].strip() if reqs and '==' in reqs[0] else ''; print(ver)" 2>/dev/null)
+        if [ -n "$TRITON_VER" ]; then
+            echo -e "${YELLOW}Torch requires triton==${TRITON_VER}${RESET}"
+            "$EMBEDDED_PYTHON" -m pip install --upgrade --force-reinstall "triton==${TRITON_VER}" $PIP_ARGS || echo -e "${YELLOW}Triton install skipped${RESET}"
+        else
+            echo -e "${YELLOW}Could not determine triton version from torch metadata, skipping${RESET}"
+        fi
     fi
     echo ""
+fi
+
+# AMD: make sure a CUDA onnxruntime pulled by a custom node is replaced
+if [ "$GPU_VENDOR" = "amd" ]; then
+    if "$EMBEDDED_PYTHON" -c "import onnxruntime, sys; sys.exit(0 if 'CUDA' in onnxruntime.get_available_providers() else 1)" 2>/dev/null; then
+        echo -e "${YELLOW}Replacing CUDA onnxruntime with the CPU build...${RESET}"
+        uv pip uninstall $UV_NC onnxruntime-gpu >/dev/null 2>&1 || true
+        uv pip install $UV_ARGS --force-reinstall onnxruntime >/dev/null 2>&1 || true
+    fi
 fi
 
 # Postinstall: resync pydantic stack to avoid version mismatch issues
@@ -1010,6 +1319,21 @@ copy_files run_nvidia_gpu.sh .
 copy_files run_nvidia_gpu_SageAttention.sh .
 copy_files extra_model_paths.yaml ComfyUI
 copy_files comfy.settings.json ComfyUI/user/default
+
+# Prefer the launcher/desktop files shipped next to the installer over the
+# copies inside the Helper zip, so AMD fixes apply even to older zips.
+if [ -f "$SCRIPT_DIR/run_amd_gpu.sh" ]; then
+    cp -f "$SCRIPT_DIR/run_amd_gpu.sh" ./run_amd_gpu.sh
+    chmod +x ./run_amd_gpu.sh
+fi
+if [ -f "$SCRIPT_DIR/comfyui_desktop.py" ]; then
+    cp -f "$SCRIPT_DIR/comfyui_desktop.py" ./comfyui_desktop.py
+fi
+if [ -f "$SCRIPT_DIR/Add-Ons/AMD-ROCm-Diagnose.sh" ]; then
+    mkdir -p ./Add-Ons
+    cp -f "$SCRIPT_DIR/Add-Ons/AMD-ROCm-Diagnose.sh" ./Add-Ons/AMD-ROCm-Diagnose.sh
+    chmod +x ./Add-Ons/AMD-ROCm-Diagnose.sh
+fi
 
 # Clear Pip and uv Cache (moved to end in v2.02.0) - Disabled for slow connections
 # clear_pip_uv_cache

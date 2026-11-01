@@ -363,9 +363,17 @@ def get_system_info():
             info["gpu"] = "MPS (Apple Silicon)" if torch.backends.mps.is_available() else "CPU"
         elif torch.cuda.is_available():
             info["gpu"] = torch.cuda.get_device_name(0)
-            info["cuda"] = torch.version.cuda or "unknown"
+            hip = getattr(torch.version, "hip", None)
+            if hip:
+                # ROCm exposes the HIP runtime through the torch.cuda API
+                info["rocm"] = hip
+                info["backend"] = "ROCm"
+            else:
+                info["cuda"] = torch.version.cuda or "unknown"
+                info["backend"] = "CUDA"
         else:
             info["gpu"] = "CPU only"
+            info["backend"] = "CPU"
     except Exception:
         _log_error('get_system_info/torch')
         info["torch"] = "not installed"
@@ -2317,6 +2325,7 @@ INJECTED_JS = """
                 html += row('PyTorch', d.torch||'—');
                 html += row('GPU / Backend', d.gpu||'—');
                 if (d.cuda) html += row('CUDA', d.cuda);
+                if (d.rocm) html += row('ROCm', d.rocm);
                 if (d.mps)  html += row('MPS available', d.mps);
                 html += row('ComfyUI rev', d.comfyui_rev||'—');
                 html += row('Frontend', d.frontend||'—');
@@ -2468,20 +2477,25 @@ INJECTED_JS = """
                 var _tp_iid = null;
                 var _tp_last = 0;
                 /* populate dropdown */
-                pywebview.api.list_torch_packs().then(function(raw) {
-                    var packs = JSON.parse(raw);
-                    var sel = document.getElementById('_cdp_tp_sel');
-                    if (!sel) return;
-                    if (!packs.length) {
-                        sel.innerHTML = '<option value="">No Torch Pack scripts found</option>';
-                        return;
-                    }
-                    var isMac = /mac/i.test(navigator.platform);
-                    sel.innerHTML = packs.map(function(p) {
-                        var label = p.name + (p.mac ? ' \u2014 macOS' : (p.cuda ? ' \u2014 CUDA' : ''));
-                        var hi = (isMac && p.mac) || (!isMac && p.cuda);
-                        return '<option value="' + p.filename + '"' + (hi ? ' style="font-weight:bold;color:#8f8"' : '') + '>' + label + '</option>';
-                    }).join('');
+                pywebview.api.get_system_info().then(function(sysRaw) {
+                    var sys = {};
+                    try { sys = JSON.parse(sysRaw); } catch (e) {}
+                    return pywebview.api.list_torch_packs().then(function(raw) {
+                        var packs = JSON.parse(raw);
+                        var sel = document.getElementById('_cdp_tp_sel');
+                        if (!sel) return;
+                        if (!packs.length) {
+                            sel.innerHTML = '<option value="">No Torch Pack scripts found</option>';
+                            return;
+                        }
+                        var isMac = /mac/i.test(navigator.platform);
+                        var isAmd = !!sys.rocm;
+                        sel.innerHTML = packs.map(function(p) {
+                            var label = p.name + (p.mac ? ' \u2014 macOS' : (p.rocm ? ' \u2014 ROCm' : (p.cuda ? ' \u2014 CUDA' : '')));
+                            var hi = (isMac && p.mac) || (!isMac && ((isAmd && p.rocm) || (!isAmd && p.cuda)));
+                            return '<option value="' + p.filename + '"' + (hi ? ' style="font-weight:bold;color:#8f8"' : '') + '>' + label + '</option>';
+                        }).join('');
+                    });
                 });
                 /* install button */
                 document.getElementById('_cdp_tp_run').onclick = function() {
@@ -3856,6 +3870,7 @@ def open_in_webview():
                     continue
                 is_mac  = "-mac" in fname.lower()
                 is_cuda = any(x in fname for x in ("cu118", "cu121", "cu124", "cu126", "cu128", "cu130"))
+                is_rocm = "rocm" in fname.lower()
                 # derive a pretty display name
                 stem = fname.replace(".sh", "")
                 name = stem.replace("-mac", " (macOS)").replace("+", " ").replace("-", " ")
@@ -3864,6 +3879,7 @@ def open_in_webview():
                     "name":     name,
                     "mac":      is_mac,
                     "cuda":     is_cuda,
+                    "rocm":     is_rocm,
                 })
             return json.dumps(results)
 

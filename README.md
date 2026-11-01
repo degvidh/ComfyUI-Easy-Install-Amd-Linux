@@ -2,7 +2,7 @@
 
 # ComfyUI-Easy-Install
 
-Portable **ComfyUI** for **macOS** and **Linux** 🔹 Pixaroma Community Edition  
+Portable **ComfyUI** for **macOS** and **Linux** 🔹 NVIDIA CUDA & AMD ROCm 🔹 Pixaroma Community Edition  
 [![GitHub Release](https://img.shields.io/github/v/release/Tavris1/ComfyUI-Easy-Install)](https://github.com/Tavris1/ComfyUI-Easy-Install/releases/latest/download/ComfyUI-Easy-Install.zip)
 [![GitHub Release Date](https://img.shields.io/github/release-date/Tavris1/ComfyUI-Easy-Install?style=flat)](https://github.com/Tavris1/ComfyUI-Easy-Install/releases)
 [![Downloads](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/Tavris1/95cfc6f0535930f25591dcfe08f34cc1/raw/downloads.json)](https://github.com/Tavris1/ComfyUI-Easy-Install/releases)
@@ -118,9 +118,129 @@ The `run_mac_mps.sh` script includes optimizations for Apple Silicon (M1/M2) Mac
    ```
 3. After installation, start ComfyUI:
    ```bash
-   ./run_nvidia_gpu.sh
+   ./run_nvidia_gpu.sh   # NVIDIA
+   ./run_amd_gpu.sh      # AMD (installed automatically on AMD systems)
    ```
+   The installer detects the GPU automatically. On AMD it installs PyTorch
+   with ROCm and creates `run_amd_gpu.sh`; on NVIDIA it uses CUDA 13.0.
 4. See the [**Add-ons Installation**](#-add-ons-installation) section below for optional add-ons like CUDA Toolkit, SageAttention, Nunchaku, and more.
+
+</details>
+
+<details>
+<summary><b>AMD ROCm Installation (Radeon / Ryzen APU)</b></summary>
+
+#### Requirements
+
+- A 64-bit Linux distribution with the `amdgpu` kernel driver loaded
+  (`lsmod | grep amdgpu`). ROCm 7.2 supports RDNA2/3/3.5/4 Radeon GPUs and
+  Ryzen AI APUs, including **gfx1150 (Strix Point, Radeon 880M/890M)** and
+  **gfx1151 (Strix Halo)**.
+- Your user in the `render` and `video` groups:
+  ```bash
+  sudo usermod -aG render,video "$USER"
+  # log out and back in (or reboot) afterwards
+  ```
+- `/dev/kfd` and `/dev/dri/renderD128` must exist and be accessible.
+- **You do not need to install the full ROCm SDK** for ComfyUI. The PyTorch
+  ROCm wheels bundle the ROCm runtime libraries. Install `rocminfo` only if
+  you want diagnostics (`sudo pacman -S rocminfo` / `sudo apt install rocminfo`).
+
+#### Install
+
+```bash
+git clone -b MAC-Linux --single-branch https://github.com/Tavris1/ComfyUI-Easy-Install.git
+cd ComfyUI-Easy-Install
+chmod +x ComfyUI-Easy-Install.sh
+./ComfyUI-Easy-Install.sh
+```
+
+The installer prints the detected backend and installs:
+
+| Component | AMD selection |
+|---|---|
+| PyTorch | `torch 2.11.0 + rocm7.2`, `torchvision 0.26.0`, `torchaudio 2.11.0` |
+| Triton | `triton-rocm` (matching the wheel, currently 3.6.0) |
+| onnxruntime | CPU build (CUDA `onnxruntime-gpu` is removed; `onnxruntime-rocm` can be added manually with a system ROCm SDK) |
+| llama.cpp | HIP if `hipcc` is available (ROCm SDK), else Vulkan, else CPU |
+
+Force a backend or a different ROCm build with environment variables:
+
+```bash
+CEI_GPU=amd ./ComfyUI-Easy-Install.sh            # force AMD
+CEI_ROCM_VERSION=7.1 ./ComfyUI-Easy-Install.sh   # use another ROCm wheel index
+CEI_AMD_GFX=gfx1150 ./ComfyUI-Easy-Install.sh    # override the LLVM target
+```
+
+#### Start
+
+```bash
+./run_amd_gpu.sh
+```
+
+The launcher sets ROCm-friendly defaults (expandable HIP allocator, MIOpen
+cache, AOTriton flash attention) and adds `--use-pytorch-cross-attention`.
+`run_comfyui_desktop.sh` (the native-window launcher) applies the same ROCm
+environment automatically.
+Settings are stored in `.vram_config`, `.comfyui_flags_config`, and
+`.cei_amd_env`.
+
+#### Tuning for an APU (shared memory)
+
+An iGPU has a small VRAM carve-out and a much larger **GTT** (shared system
+RAM) pool. The launcher reads both from `/sys/class/drm/card*/device/` and
+recommends `normal` when GTT is 8 GiB or more. Keep 6–8 GiB of system RAM free
+for the OS and the CPU-side model weights.
+
+Edit `.cei_amd_env` to add optional overrides:
+
+```bash
+# Only if the bundled runtime cannot see the GPU (older ROCm / new silicon)
+HSA_OVERRIDE_GFX_VERSION=11.0.0
+# If the APU freezes under sustained load
+HSA_ENABLE_SDMA=0
+```
+
+Useful ComfyUI flags (add them via the launcher's `f` menu):
+`--use-pytorch-cross-attention` (already default), `--lowvram` for very small
+GTT, `--highvram` only when the model fits comfortably in GTT.
+
+#### This reference machine
+
+| Item | Value |
+|---|---|
+| CPU / GPU | AMD Ryzen AI 9 365 w/ Radeon 880M |
+| LLVM target | `gfx1150` (Strix Point, RDNA 3.5) |
+| Memory | 4 GiB VRAM carve-out + 24 GiB GTT, 27 GiB RAM |
+| Kernel / driver | Arch Linux, `amdgpu`, `/dev/kfd` + `renderD128` |
+| Torch stack | PyTorch 2.11.0 + ROCm 7.2 |
+
+On this configuration, use **normal VRAM** (the launcher auto-selects it) and
+SDXL/Flux GGUF models at reduced resolution. `gfx1150` kernels are included
+natively in the PyTorch 2.11 ROCm 7.2 wheels, so no HSA override is needed.
+
+#### Verify / troubleshoot
+
+```bash
+./Add-Ons/AMD-ROCm-Diagnose.sh
+```
+
+The diagnostic checks the kernel driver, `/dev/kfd` permissions, groups, GTT
+and VRAM, `rocminfo`, and the torch HIP device. Common fixes:
+
+- `GPU available: False` → check `render`/`video` groups and reboot.
+- `HIP runtime: None` → the CUDA wheel was reinstalled by a custom node; run
+  `Add-Ons/Torch-Pack/Torch2.11.0+rocm7.2.sh`.
+- Node import errors mentioning `triton`, `flash_attn`, `xformers`, or
+  `onnxruntime-gpu` → CUDA-only package; disable that node or install a CPU
+  alternative. The installer already filters these from node requirements.
+- `HSA_OVERRIDE_GFX_VERSION=11.0.0` is a **last resort** for unsupported
+  targets; it makes the runtime use gfx1100 kernels.
+
+> [!WARNING]
+> CUDA-only add-ons do not work on ROCm: **SageAttention**, **FlashAttention**,
+> **Nunchaku**, and the CUDA Toolkit installer. The Torch-Pack list marks the
+> ROCm pack as recommended on AMD systems.
 
 </details>
 
@@ -170,6 +290,21 @@ After the main installation, you can install optional add-ons from the `Add-Ons/
 > [!IMPORTANT]
 > The installer automatically flattens the folder structure. All add-on scripts are in `Add-Ons/` at the top level of your installation folder.
 
+### AMD ROCm systems
+
+On AMD, **skip every CUDA-only add-on**:
+
+| Add-on | AMD status |
+|---|---|
+| CUDA Toolkit | ❌ NVIDIA only |
+| SageAttention / FlashAttention | ❌ CUDA-only builds |
+| Nunchaku | ❌ CUDA-only |
+| Torch-Pack `+rocm7.2` | ✅ recommended |
+| `Add-Ons/AMD-ROCm-Diagnose.sh` | ✅ recommended |
+
+`run_amd_gpu.sh` already enables PyTorch cross-attention and the ROCm
+flash-attention path, so no extra attention add-on is required.
+
 ### Recommended Order of Operations (Linux)
 
 For Linux users planning to install CUDA-dependent add-ons like SageAttention, follow this order:
@@ -209,13 +344,14 @@ Quickly switch between different Torch/CUDA versions. Available for both macOS a
 
 **Linux variants:**
 
-| Script | Torch | CUDA |
+| Script | Torch | Backend |
 |---|---|---|
-| `Torch2.7.1+cu128.sh` | 2.7.1 | 12.8 |
-| `Torch2.8.0+cu128.sh` | 2.8.0 | 12.8 |
-| `Torch2.9.1+cu130.sh` | 2.9.1 | 13.0 |
-| `Torch2.10.0+cu130.sh` | 2.10.0 | 13.0 |
-| `Torch2.13.0+cu130.sh` | 2.13.0 | 13.0 |
+| `Torch2.7.1+cu128.sh` | 2.7.1 | CUDA 12.8 |
+| `Torch2.8.0+cu128.sh` | 2.8.0 | CUDA 12.8 |
+| `Torch2.9.1+cu130.sh` | 2.9.1 | CUDA 13.0 |
+| `Torch2.10.0+cu130.sh` | 2.10.0 | CUDA 13.0 |
+| `Torch2.13.0+cu130.sh` | 2.13.0 | CUDA 13.0 |
+| `Torch2.11.0+rocm7.2.sh` | 2.11.0 | ROCm 7.2 |
 
 **macOS variants:**
 
@@ -225,7 +361,8 @@ Quickly switch between different Torch/CUDA versions. Available for both macOS a
 | `Torch2.13.0-mac.sh` | 2.13.0 |
 
 ```bash
-bash Add-Ons/Torch-Pack/Torch2.13.0+cu130.sh    # Linux
+bash Add-Ons/Torch-Pack/Torch2.13.0+cu130.sh     # Linux / NVIDIA
+bash Add-Ons/Torch-Pack/Torch2.11.0+rocm7.2.sh   # Linux / AMD
 bash Add-Ons/Torch-Pack/Torch2.13.0-mac.sh       # macOS
 ```
 
